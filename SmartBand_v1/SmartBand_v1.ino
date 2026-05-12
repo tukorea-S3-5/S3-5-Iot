@@ -1,3 +1,13 @@
+/*
+  MOMFIT SmartBand
+
+  기준:
+  - 심박 측정은 SparkFun Example5_HeartRate의 PBA 알고리즘과 beatAvg 계산 방식을 따른다.
+  - 1초마다 프론트로 평균 심박수(beatAvg)를 전송한다.
+  - 손가락 미착용 또는 평균값 준비 전에는 0을 전송한다.
+  - 프론트에서 COMMAND_UUID로 "1"을 보내면 1초 동안 진동한다.
+*/
+
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -15,98 +25,92 @@
 #define COMMAND_UUID        "19b10002-e8f2-537e-4f6c-d104768a1214"
 
 // BLE 객체
-BLEServer* pServer = NULL;
-BLECharacteristic* pHeartRateCharacteristic = NULL;
-BLECharacteristic* pCommandCharacteristic = NULL;
+BLEServer* pServer = nullptr;
+BLECharacteristic* pHeartRateCharacteristic = nullptr;
+BLECharacteristic* pCommandCharacteristic = nullptr;
 volatile bool deviceConnected = false;
 
-// 심박 전송 타이머
-unsigned long previousMillis = 0;
-const unsigned long interval = 1000;
-
-// 심박 센서 변수
+// MAX30105 센서
 MAX30105 particleSensor;
-const byte RATE_SIZE = 4;
-int rates[RATE_SIZE];
+
+// Sample5_HeartRate 기준 심박 평균 변수
+const byte RATE_SIZE = 4;     // 최근 4개 BPM 평균
+byte rates[RATE_SIZE];        // byte 배열 사용
 byte rateSpot = 0;
 long lastBeat = 0;
+
 float beatsPerMinute = 0;
 int beatAvg = 0;
-byte validRateCount = 0;
-bool fingerDetected = false;
 
-const long FINGER_OFF_THRESHOLD = 30000;
-const long FINGER_ON_THRESHOLD = 70000;
+// 전송 주기: 1초마다 프론트로 값 전송
+unsigned long previousSendMillis = 0;
+const unsigned long SEND_INTERVAL = 1000;
 
-// BPM 필터 기준
-const int MIN_BPM = 45;
-const int MAX_BPM = 160;
-const int MAX_BPM_JUMP = 30;
-const long MIN_DELTA = 350;
-const long MAX_DELTA = 1500;
+// 손가락 감지 기준
+const long NO_FINGER_THRESHOLD = 50000;
 
-// 진동 모터 제어 변수
+// 진동 제어
 bool isVibrating = false;
 unsigned long vibrationStartMillis = 0;
-const unsigned long vibrationDuration = 1000;
-
-const bool VIBRATION_ACTIVE_LOW = false;
+const unsigned long VIBRATION_DURATION = 1000;
 
 void vibrationOn() {
-  if (VIBRATION_ACTIVE_LOW) {
-    digitalWrite(VIBRATION_PIN, LOW);
-  } else {
-    digitalWrite(VIBRATION_PIN, HIGH);
-  }
+  digitalWrite(VIBRATION_PIN, HIGH);
 }
 
 void vibrationOff() {
-  if (VIBRATION_ACTIVE_LOW) {
-    digitalWrite(VIBRATION_PIN, HIGH);
-  } else {
-    digitalWrite(VIBRATION_PIN, LOW);
-  }
+  digitalWrite(VIBRATION_PIN, LOW);
 }
 
 void startVibration() {
   vibrationOn();
   vibrationStartMillis = millis();
   isVibrating = true;
-  Serial.println("진동 시작");
+  Serial.println("진동 시작: 1초 동안 동작");
 }
 
-void resetHeartRateState() {
-  beatAvg = 0;
+void resetHeartRateValues() {
   beatsPerMinute = 0;
-  validRateCount = 0;
-  rateSpot = 0;
+  beatAvg = 0;
   lastBeat = 0;
+  rateSpot = 0;
 
   for (byte i = 0; i < RATE_SIZE; i++) {
     rates[i] = 0;
   }
 }
 
-class MomfitCallbacks : public BLEServerCallbacks {
+void notifyHeartRate(int bpm) {
+  if (!deviceConnected || pHeartRateCharacteristic == nullptr) return;
+
+  String bpmString = String(bpm);
+  pHeartRateCharacteristic->setValue(bpmString.c_str());
+  pHeartRateCharacteristic->notify();
+
+  Serial.print("프론트로 전송한 BPM: ");
+  Serial.println(bpmString);
+}
+
+class MomfitServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) override {
     deviceConnected = true;
-    Serial.println("프론트엔드와 BLE 연결 성공");
+    Serial.println("프론트 연결 성공");
   }
 
   void onDisconnect(BLEServer* pServer) override {
     deviceConnected = false;
-    Serial.println("BLE 연결 끊어짐. 다시 광고 시작");
+    Serial.println("프론트 연결 끊김. 다시 연결 대기 시작");
     pServer->getAdvertising()->start();
+    Serial.println("프론트 연결 대기 중...");
   }
 };
 
 class CommandCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) override {
     String value = pCharacteristic->getValue();
-
     if (value.length() == 0) return;
 
-    Serial.print("받은 명령: ");
+    Serial.print("프론트에서 받은 진동 명령: ");
     Serial.println(value);
 
     if (value == "1") {
@@ -119,36 +123,20 @@ class CommandCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(VIBRATION_PIN, OUTPUT);
-  vibrationOff();
-
-  delay(200);
-
-  Serial.println("센서 초기화 중...");
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("센서 연결 실패! 배선을 확인하세요.");
-    while (1);
-  }
-
-  particleSensor.setup(20, 4, 2, 100, 411, 4096);
-  particleSensor.setPulseAmplitudeRed(0x0A);
-  particleSensor.setPulseAmplitudeGreen(0);
-
+void setupBLE() {
   BLEDevice::init("MOMFIT_Wearable");
+
   pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MomfitCallbacks());
+  pServer->setCallbacks(new MomfitServerCallbacks());
 
   BLEService* pService = pServer->createService(SERVICE_UUID);
 
   pHeartRateCharacteristic = pService->createCharacteristic(
     HEART_RATE_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
   );
   pHeartRateCharacteristic->addDescriptor(new BLE2902());
+  pHeartRateCharacteristic->setValue("0");
 
   pCommandCharacteristic = pService->createCharacteristic(
     COMMAND_UUID,
@@ -157,112 +145,97 @@ void setup() {
   pCommandCharacteristic->setCallbacks(new CommandCallbacks());
 
   pService->start();
-  pServer->getAdvertising()->start();
 
-  Serial.println("BLE 서버 시작 완료. 앱에서 연결해주세요!");
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+
+  BLEDevice::startAdvertising();
+  Serial.println("BLE 서버 시작 완료");
+  Serial.println("프론트 연결 대기 중...");
+}
+
+void setupSensor() {
+  Serial.println("MAX30105 센서 초기화 중...");
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105를 찾을 수 없습니다. 배선/전원을 확인하세요.");
+    while (1);
+  }
+
+  Serial.println("센서 초기화 완료. 손가락을 센서에 안정적으로 올려주세요.");
+
+  // 기본 설정
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  resetHeartRateValues();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("MOMFIT SmartBand 시작");
+
+  pinMode(VIBRATION_PIN, OUTPUT);
+  vibrationOff();
+
+  setupSensor();
+  setupBLE();
 }
 
 void loop() {
   long irValue = particleSensor.getIR();
 
-  // 1. 손가락 감지 / 이탈 상태 처리
-  if (irValue < FINGER_OFF_THRESHOLD) {
-    if (fingerDetected) {
-      Serial.println("손가락 이탈 - 측정 상태 초기화");
-      resetHeartRateState();
-      fingerDetected = false;
-    }
-  } else if (irValue > FINGER_ON_THRESHOLD) {
-    if (!fingerDetected) {
-      Serial.println("손가락 감지 - 새 측정 시작");
-      resetHeartRateState();
-      fingerDetected = true;
-    }
-  }
+  // Sample5_HeartRate 예제의 심박 계산 방식 사용
+  if (checkForBeat(irValue) == true) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
 
-  // 2. 심박 감지
-  if (fingerDetected && checkForBeat(irValue) == true) {
-    unsigned long now = millis();
+    beatsPerMinute = 60 / (delta / 1000.0);
 
-    if (lastBeat == 0) {
-      lastBeat = now;
-      Serial.println("첫 박동 감지 - 워밍업");
-    } else {
-      long delta = now - lastBeat;
-      lastBeat = now;
-
-      // 1차 필터: 박동 간격 이상값 제거
-      if (delta < MIN_DELTA || delta > MAX_DELTA) {
-        Serial.print("delta 이상값 제외: ");
-        Serial.println(delta);
-        return;
-      }
-
-      beatsPerMinute = 60.0 / (delta / 1000.0);
-
-      // 2차 필터: BPM 범위 이상값 제거
-      if (beatsPerMinute < MIN_BPM || beatsPerMinute > MAX_BPM) {
-        Serial.print("BPM 범위 이상값 제외: ");
-        Serial.println(beatsPerMinute);
-        return;
-      }
-
-      // 3차 필터: 평균 대비 너무 튀는 값 제거
-      if (beatAvg > 0 && abs((int)beatsPerMinute - beatAvg) > MAX_BPM_JUMP) {
-        Serial.print("평균 대비 튐 값 제외: ");
-        Serial.println(beatsPerMinute);
-        return;
-      }
-
-      rates[rateSpot++] = (int)beatsPerMinute;
+    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+      rates[rateSpot++] = (byte)beatsPerMinute;
       rateSpot %= RATE_SIZE;
 
-      if (validRateCount < RATE_SIZE) {
-        validRateCount++;
+      beatAvg = 0;
+      for (byte x = 0; x < RATE_SIZE; x++) {
+        beatAvg += rates[x];
       }
-
-      if (validRateCount == RATE_SIZE) {
-        int sum = 0;
-        for (byte x = 0; x < RATE_SIZE; x++) {
-          sum += rates[x];
-        }
-        beatAvg = sum / RATE_SIZE;
-      } else {
-        beatAvg = 0;
-      }
-
-      Serial.print("현재 BPM: ");
-      Serial.print((int)beatsPerMinute);
-      Serial.print(" / 평균 BPM: ");
-      Serial.println(beatAvg);
+      beatAvg /= RATE_SIZE;
     }
   }
 
-  // 3. 1초마다 프론트로 전송
+  // 시리얼 모니터 확인용 로그
+  Serial.print("IR=");
+  Serial.print(irValue);
+  Serial.print(", BPM=");
+  Serial.print(beatsPerMinute);
+  Serial.print(", Avg BPM=");
+  Serial.print(beatAvg);
+
+  if (irValue < NO_FINGER_THRESHOLD) {
+    Serial.print(" No finger?");
+  }
+  Serial.println();
+
+  // 1초마다 프론트로 평균 BPM 전송
   unsigned long currentMillis = millis();
+  if (currentMillis - previousSendMillis >= SEND_INTERVAL) {
+    previousSendMillis = currentMillis;
 
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
-
-    const unsigned long beatTimeout = 5000;
-
-    if (fingerDetected && lastBeat != 0 && (millis() - lastBeat > beatTimeout)) {
-      Serial.println("박동 타임아웃! 찌꺼기 데이터 강제 초기화 (재측정 시작)");
-      resetHeartRateState();
-    }
-
-    if (deviceConnected) {
-      String bpmString = String(beatAvg);
-      pHeartRateCharacteristic->setValue(bpmString.c_str());
-      pHeartRateCharacteristic->notify();
-
-      Serial.print("앱으로 전송한 BPM: ");
-      Serial.println(bpmString);
+    if (irValue < NO_FINGER_THRESHOLD) {
+      resetHeartRateValues();
+      notifyHeartRate(0);
+    } else {
+      notifyHeartRate(beatAvg);
     }
   }
 
-  // 4. 진동 자동 종료
-  if (isVibrating && millis() - vibrationStartMillis >= vibrationDuration) {
+  // 진동 1초 후 자동 종료
+  if (isVibrating && millis() - vibrationStartMillis >= VIBRATION_DURATION) {
     vibrationOff();
     isVibrating = false;
     Serial.println("진동 자동 종료");
